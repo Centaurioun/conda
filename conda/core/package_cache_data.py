@@ -1,35 +1,31 @@
 # Copyright (C) 2012 Anaconda, Inc
 # SPDX-License-Identifier: BSD-3-Clause
-from __future__ import absolute_import, division, print_function, unicode_literals, annotations
+"""Tools for managing the package cache (previously downloaded packages)."""
+from __future__ import annotations
 
 import codecs
 import os
-
 from collections import defaultdict
-from concurrent.futures import as_completed, ThreadPoolExecutor, Future
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from errno import EACCES, ENOENT, EPERM, EROFS
+from functools import partial
+from itertools import chain
 from json import JSONDecodeError
 from logging import getLogger
 from os import scandir
 from os.path import basename, dirname, getsize, join
 from sys import platform
 from tarfile import ReadError
-from functools import partial
-from typing import Union
 
-try:
-    from tlz.itertoolz import concat, concatv, groupby
-except ImportError:
-    from conda._vendor.toolz.itertoolz import concat, concatv, groupby
+from conda.common.iterators import groupby_to_dict as groupby
 
-from .path_actions import CacheUrlAction, ExtractPackageAction
 from .. import CondaError, CondaMultiError, conda_signal_handler
 from ..auxlib.collection import first
 from ..auxlib.decorators import memoizemethod
 from ..base.constants import (
-    CONDA_PACKAGE_EXTENSIONS,
     CONDA_PACKAGE_EXTENSION_V1,
     CONDA_PACKAGE_EXTENSION_V2,
+    CONDA_PACKAGE_EXTENSIONS,
     PACKAGE_CACHE_MAGIC_FILE,
 )
 from ..base.context import context
@@ -38,7 +34,8 @@ from ..common.io import ProgressBar, time_recorder
 from ..common.path import expand, strip_pkg_extension, url_to_path
 from ..common.signals import signal_handler
 from ..common.url import path_to_url
-from ..exceptions import NoWritablePkgsDirError, NotWritableError
+from ..deprecations import deprecated
+from ..exceptions import NotWritableError, NoWritablePkgsDirError
 from ..gateways.disk.create import (
     create_package_cache_directory,
     extract_tarball,
@@ -46,7 +43,7 @@ from ..gateways.disk.create import (
 )
 from ..gateways.disk.delete import rm_rf
 from ..gateways.disk.read import (
-    compute_md5sum,
+    compute_sum,
     isdir,
     isfile,
     islink,
@@ -58,6 +55,7 @@ from ..gateways.disk.test import file_path_is_writable
 from ..models.match_spec import MatchSpec
 from ..models.records import PackageCacheRecord, PackageRecord
 from ..utils import human_bytes
+from .path_actions import CacheUrlAction, ExtractPackageAction
 
 log = getLogger(__name__)
 
@@ -72,9 +70,7 @@ EXTRACT_THREADS = min(os.cpu_count() or 1, 3) if THREADSAFE_EXTRACT else 1
 
 
 class PackageCacheType(type):
-    """
-    This metaclass does basic caching of PackageCache instance objects.
-    """
+    """This metaclass does basic caching of PackageCache instance objects."""
 
     def __call__(cls, pkgs_dir):
         if isinstance(pkgs_dir, PackageCacheData):
@@ -82,7 +78,7 @@ class PackageCacheType(type):
         elif pkgs_dir in PackageCacheData._cache_:
             return PackageCacheData._cache_[pkgs_dir]
         else:
-            package_cache_instance = super(PackageCacheType, cls).__call__(pkgs_dir)
+            package_cache_instance = super().__call__(pkgs_dir)
             PackageCacheData._cache_[pkgs_dir] = package_cache_instance
             return package_cache_instance
 
@@ -98,8 +94,9 @@ class PackageCacheData(metaclass=PackageCacheType):
         self._urls_data = UrlsData(pkgs_dir)
 
     def insert(self, package_cache_record):
-
-        meta = join(package_cache_record.extracted_package_dir, "info", "repodata_record.json")
+        meta = join(
+            package_cache_record.extracted_package_dir, "info", "repodata_record.json"
+        )
         write_as_json_to_file(meta, PackageRecord.from_objects(package_cache_record))
 
         self._package_cache_records[package_cache_record] = package_cache_record
@@ -153,10 +150,18 @@ class PackageCacheData(metaclass=PackageCacheType):
         if isinstance(param, str):
             param = MatchSpec(param)
         if isinstance(param, MatchSpec):
-            return (pcrec for pcrec in self._package_cache_records.values() if param.match(pcrec))
+            return (
+                pcrec
+                for pcrec in self._package_cache_records.values()
+                if param.match(pcrec)
+            )
         else:
             assert isinstance(param, PackageRecord)
-            return (pcrec for pcrec in self._package_cache_records.values() if pcrec == param)
+            return (
+                pcrec
+                for pcrec in self._package_cache_records.values()
+                if pcrec == param
+            )
 
     def iter_records(self):
         return iter(self._package_cache_records)
@@ -166,7 +171,7 @@ class PackageCacheData(metaclass=PackageCacheType):
         if pkgs_dirs is None:
             pkgs_dirs = context.pkgs_dirs
 
-        return concat(
+        return chain.from_iterable(
             pcache.query(package_ref_or_match_spec)
             for pcache in cls.all_caches_writable_first(pkgs_dirs)
         )
@@ -199,7 +204,9 @@ class PackageCacheData(metaclass=PackageCacheType):
     def writable_caches(cls, pkgs_dirs=None):
         if pkgs_dirs is None:
             pkgs_dirs = context.pkgs_dirs
-        writable_caches = tuple(filter(lambda c: c.is_writable, (cls(pd) for pd in pkgs_dirs)))
+        writable_caches = tuple(
+            filter(lambda c: c.is_writable, (cls(pd) for pd in pkgs_dirs))
+        )
         return writable_caches
 
     @classmethod
@@ -216,14 +223,16 @@ class PackageCacheData(metaclass=PackageCacheType):
         if pkgs_dirs is None:
             pkgs_dirs = context.pkgs_dirs
         pc_groups = groupby(lambda pc: pc.is_writable, (cls(pd) for pd in pkgs_dirs))
-        return tuple(concatv(pc_groups.get(True, ()), pc_groups.get(False, ())))
+        return (*pc_groups.get(True, ()), *pc_groups.get(False, ()))
 
     @classmethod
     def get_all_extracted_entries(cls):
         package_caches = (cls(pd) for pd in context.pkgs_dirs)
         return tuple(
             pc_entry
-            for pc_entry in concat((package_cache.values() for package_cache in package_caches))
+            for pc_entry in chain.from_iterable(
+                package_cache.values() for package_cache in package_caches
+            )
             if pc_entry.is_extracted
         )
 
@@ -251,11 +260,15 @@ class PackageCacheData(metaclass=PackageCacheType):
         )
         if pc_entry is not None:
             return pc_entry
-        raise CondaError("No package '%s' found in cache directories." % package_ref.dist_str())
+        raise CondaError(
+            "No package '%s' found in cache directories." % package_ref.dist_str()
+        )
 
     @classmethod
     def tarball_file_in_cache(cls, tarball_path, md5sum=None, exclude_caches=()):
-        tarball_full_path, md5sum = cls._clean_tarball_path_and_get_md5sum(tarball_path, md5sum)
+        tarball_full_path, md5sum = cls._clean_tarball_path_and_get_md5sum(
+            tarball_path, md5sum
+        )
         pc_entry = first(
             cls(pkgs_dir).tarball_file_in_this_cache(tarball_full_path, md5sum)
             for pkgs_dir in context.pkgs_dirs
@@ -268,11 +281,14 @@ class PackageCacheData(metaclass=PackageCacheType):
         cls._cache_.clear()
 
     def tarball_file_in_this_cache(self, tarball_path, md5sum=None):
-        tarball_full_path, md5sum = self._clean_tarball_path_and_get_md5sum(tarball_path, md5sum)
+        tarball_full_path, md5sum = self._clean_tarball_path_and_get_md5sum(
+            tarball_path, md5sum
+        )
         tarball_basename = basename(tarball_full_path)
         pc_entry = first(
             (pc_entry for pc_entry in self.values()),
-            key=lambda pce: pce.tarball_basename == tarball_basename and pce.md5 == md5sum,
+            key=lambda pce: pce.tarball_basename == tarball_basename
+            and pce.md5 == md5sum,
         )
         return pc_entry
 
@@ -308,7 +324,7 @@ class PackageCacheData(metaclass=PackageCacheType):
         tarball_full_path = expand(tarball_path)
 
         if isfile(tarball_full_path) and md5sum is None:
-            md5sum = compute_md5sum(tarball_full_path)
+            md5sum = compute_sum(tarball_full_path, "md5")
 
         return tarball_full_path, md5sum
 
@@ -329,8 +345,8 @@ class PackageCacheData(metaclass=PackageCacheType):
         return self._package_cache_records.values()
 
     def __repr__(self):
-        args = ("%s=%r" % (key, getattr(self, key)) for key in ("pkgs_dir",))
-        return "%s(%s)" % (self.__class__.__name__, ", ".join(args))
+        args = (f"{key}={getattr(self, key)!r}" for key in ("pkgs_dir",))
+        return "{}({})".format(self.__class__.__name__, ", ".join(args))
 
     def _make_single_record(self, package_filename):
         # delay-load this to help make sure libarchive can be found
@@ -349,7 +365,7 @@ class PackageCacheData(metaclass=PackageCacheType):
                 extracted_package_dir=extracted_package_dir,
             )
             return package_cache_record
-        except (EnvironmentError, JSONDecodeError, ValueError, FileNotFoundError) as e:
+        except (OSError, JSONDecodeError, ValueError, FileNotFoundError) as e:
             # EnvironmentError if info/repodata_record.json doesn't exists
             # JsonDecodeError if info/repodata_record.json is partially extracted or corrupted
             #   python 2.7 raises ValueError instead of JsonDecodeError
@@ -363,7 +379,7 @@ class PackageCacheData(metaclass=PackageCacheType):
             # try reading info/index.json
             try:
                 raw_json_record = read_index_json(extracted_package_dir)
-            except (EnvironmentError, JSONDecodeError, ValueError, FileNotFoundError) as e:
+            except (OSError, JSONDecodeError, ValueError, FileNotFoundError) as e:
                 # EnvironmentError if info/index.json doesn't exist
                 # JsonDecodeError if info/index.json is partially extracted or corrupted
                 #   python 2.7 raises ValueError instead of JsonDecodeError
@@ -374,7 +390,9 @@ class PackageCacheData(metaclass=PackageCacheType):
                     e,
                 )
 
-                if isdir(extracted_package_dir) and not isfile(package_tarball_full_path):
+                if isdir(extracted_package_dir) and not isfile(
+                    package_tarball_full_path
+                ):
                     # We have a directory that looks like a conda package, but without
                     # (1) info/repodata_record.json or info/index.json, and (2) a conda package
                     # tarball, there's not much we can do.  We'll just ignore it.
@@ -387,8 +405,10 @@ class PackageCacheData(metaclass=PackageCacheType):
                             # to do is remove it and try extracting.
                             rm_rf(extracted_package_dir)
                         try:
-                            extract_tarball(package_tarball_full_path, extracted_package_dir)
-                        except (EnvironmentError, InvalidArchiveError) as e:
+                            extract_tarball(
+                                package_tarball_full_path, extracted_package_dir
+                            )
+                        except (OSError, InvalidArchiveError) as e:
                             if e.errno == ENOENT:
                                 # FileNotFoundError(2, 'No such file or directory')
                                 # At this point, we can assume the package tarball is bad.
@@ -399,15 +419,22 @@ class PackageCacheData(metaclass=PackageCacheType):
                                 return None
                         try:
                             raw_json_record = read_index_json(extracted_package_dir)
-                        except (IOError, OSError, JSONDecodeError, FileNotFoundError):
+                        except (OSError, JSONDecodeError, FileNotFoundError):
                             # At this point, we can assume the package tarball is bad.
                             # Remove everything and move on.
                             rm_rf(package_tarball_full_path)
                             rm_rf(extracted_package_dir)
                             return None
                     else:
-                        raw_json_record = read_index_json_from_tarball(package_tarball_full_path)
-                except (EOFError, ReadError, FileNotFoundError, InvalidArchiveError) as e:
+                        raw_json_record = read_index_json_from_tarball(
+                            package_tarball_full_path
+                        )
+                except (
+                    EOFError,
+                    ReadError,
+                    FileNotFoundError,
+                    InvalidArchiveError,
+                ) as e:
                     # EOFError: Compressed file ended before the end-of-stream marker was reached
                     # tarfile.ReadError: file could not be opened successfully
                     # We have a corrupted tarball. Remove the tarball so it doesn't affect
@@ -422,7 +449,7 @@ class PackageCacheData(metaclass=PackageCacheType):
 
             # we were able to read info/index.json, so let's continue
             if isfile(package_tarball_full_path):
-                md5 = compute_md5sum(package_tarball_full_path)
+                md5 = compute_sum(package_tarball_full_path, "md5")
             else:
                 md5 = None
 
@@ -440,12 +467,18 @@ class PackageCacheData(metaclass=PackageCacheType):
             # write the info/repodata_record.json file so we can short-circuit this next time
             if self.is_writable:
                 repodata_record = PackageRecord.from_objects(package_cache_record)
-                repodata_record_path = join(extracted_package_dir, "info", "repodata_record.json")
+                repodata_record_path = join(
+                    extracted_package_dir, "info", "repodata_record.json"
+                )
                 try:
                     write_as_json_to_file(repodata_record_path, repodata_record)
-                except (IOError, OSError) as e:
-                    if e.errno in (EACCES, EPERM, EROFS) and isdir(dirname(repodata_record_path)):
-                        raise NotWritableError(repodata_record_path, e.errno, caused_by=e)
+                except OSError as e:
+                    if e.errno in (EACCES, EPERM, EROFS) and isdir(
+                        dirname(repodata_record_path)
+                    ):
+                        raise NotWritableError(
+                            repodata_record_path, e.errno, caused_by=e
+                        )
                     else:
                         raise
 
@@ -469,15 +502,15 @@ class PackageCacheData(metaclass=PackageCacheType):
         tar_bz2_extensions = groups[_CONDA_TARBALL_EXTENSION_V1] - conda_extensions
         others = groups[None] - conda_extensions - tar_bz2_extensions
         return sorted(
-            concatv(
-                (p + _CONDA_TARBALL_EXTENSION_V2 for p in conda_extensions),
-                (p + _CONDA_TARBALL_EXTENSION_V1 for p in tar_bz2_extensions),
-                others,
+            (
+                *(path + _CONDA_TARBALL_EXTENSION_V2 for path in conda_extensions),
+                *(path + _CONDA_TARBALL_EXTENSION_V1 for path in tar_bz2_extensions),
+                *others,
             )
         )
 
 
-class UrlsData(object):
+class UrlsData:
     # this is a class to manage urls.txt
     # it should basically be thought of as a sequence
     # in this class I'm breaking the rule that all disk access goes through conda.gateways
@@ -513,7 +546,7 @@ class UrlsData(object):
         #       That's probably a good assumption going forward, because we should now always
         #       be recording the extension in urls.txt.  The extensionless situation should be
         #       legacy behavior only.
-        if not package_path.endswith(CONDA_PACKAGE_EXTENSION_V1):
+        if not package_path.endswith(CONDA_PACKAGE_EXTENSIONS):
             package_path += CONDA_PACKAGE_EXTENSION_V1
         return first(self, lambda url: basename(url) == package_path)
 
@@ -523,7 +556,7 @@ class UrlsData(object):
 # ##############################
 
 
-class ProgressiveFetchExtract(object):
+class ProgressiveFetchExtract:
     @staticmethod
     def make_actions_for_record(pref_or_spec):
         assert pref_or_spec is not None
@@ -555,7 +588,7 @@ class ProgressiveFetchExtract(object):
         extracted_pcrec = next(
             (
                 pcrec
-                for pcrec in concat(
+                for pcrec in chain.from_iterable(
                     PackageCacheData(pkgs_dir).query(pref_or_spec)
                     for pkgs_dir in context.pkgs_dirs
                 )
@@ -563,7 +596,11 @@ class ProgressiveFetchExtract(object):
             ),
             None,
         )
-        if extracted_pcrec and pcrec_matches(extracted_pcrec) and extracted_pcrec.get("url"):
+        if (
+            extracted_pcrec
+            and pcrec_matches(extracted_pcrec)
+            and extracted_pcrec.get("url")
+        ):
             return None, None
 
         # there is no extracted dist that can work, so now we look for tarballs that
@@ -574,8 +611,9 @@ class ProgressiveFetchExtract(object):
         pcrec_from_writable_cache = next(
             (
                 pcrec
-                for pcrec in concat(
-                    pcache.query(pref_or_spec) for pcache in PackageCacheData.writable_caches()
+                for pcrec in chain.from_iterable(
+                    pcache.query(pref_or_spec)
+                    for pcache in PackageCacheData.writable_caches()
                 )
                 if pcrec.is_fetched
             ),
@@ -589,8 +627,12 @@ class ProgressiveFetchExtract(object):
             # extract in place
             extract_action = ExtractPackageAction(
                 source_full_path=pcrec_from_writable_cache.package_tarball_full_path,
-                target_pkgs_dir=dirname(pcrec_from_writable_cache.package_tarball_full_path),
-                target_extracted_dirname=basename(pcrec_from_writable_cache.extracted_package_dir),
+                target_pkgs_dir=dirname(
+                    pcrec_from_writable_cache.package_tarball_full_path
+                ),
+                target_extracted_dirname=basename(
+                    pcrec_from_writable_cache.extracted_package_dir
+                ),
                 record_or_spec=pcrec_from_writable_cache,
                 sha256=pcrec_from_writable_cache.sha256 or sha256,
                 size=pcrec_from_writable_cache.size or size,
@@ -601,8 +643,9 @@ class ProgressiveFetchExtract(object):
         pcrec_from_read_only_cache = next(
             (
                 pcrec
-                for pcrec in concat(
-                    pcache.query(pref_or_spec) for pcache in PackageCacheData.read_only_caches()
+                for pcrec in chain.from_iterable(
+                    pcache.query(pref_or_spec)
+                    for pcache in PackageCacheData.read_only_caches()
                 )
                 if pcrec.is_fetched
             ),
@@ -622,7 +665,9 @@ class ProgressiveFetchExtract(object):
                 size=pcrec_from_read_only_cache.get("size") or size,
                 md5=pcrec_from_read_only_cache.get("md5") or md5,
             )
-            trgt_extracted_dirname = strip_pkg_extension(pcrec_from_read_only_cache.fn)[0]
+            trgt_extracted_dirname = strip_pkg_extension(pcrec_from_read_only_cache.fn)[
+                0
+            ]
             extract_action = ExtractPackageAction(
                 source_full_path=cache_action.target_full_path,
                 target_pkgs_dir=first_writable_cache.pkgs_dir,
@@ -661,7 +706,7 @@ class ProgressiveFetchExtract(object):
     def __init__(self, link_prefs):
         """
         Args:
-            link_prefs (Tuple[PackageRecord]):
+            link_prefs (tuple[PackageRecord]):
                 A sequence of :class:`PackageRecord`s to ensure available in a known
                 package cache, typically for a follow-on :class:`UnlinkLinkTransaction`.
                 Here, "available" means the package tarball is both downloaded and extracted
@@ -674,7 +719,9 @@ class ProgressiveFetchExtract(object):
             "\n  ".join(pkg_rec.dist_str() for pkg_rec in link_prefs),
         )
 
-        self.paired_actions = {}  # Map[pref, Tuple(CacheUrlAction, ExtractPackageAction)]
+        self.paired_actions = (
+            {}
+        )  # Map[pref, Tuple(CacheUrlAction, ExtractPackageAction)]
 
         self._prepared = False
         self._executed = False
@@ -731,11 +778,15 @@ class ProgressiveFetchExtract(object):
 
         with signal_handler(conda_signal_handler), time_recorder(
             "fetch_extract_execute"
-        ), ThreadPoolExecutor(context.fetch_threads) as fetch_executor, ThreadPoolExecutor(
+        ), ThreadPoolExecutor(
+            context.fetch_threads
+        ) as fetch_executor, ThreadPoolExecutor(
             EXTRACT_THREADS
         ) as extract_executor:
-
-            for prec_or_spec, (cache_action, extract_action) in self.paired_actions.items():
+            for prec_or_spec, (
+                cache_action,
+                extract_action,
+            ) in self.paired_actions.items():
                 if cache_action is None and extract_action is None:
                     # Not sure when this is reached.
                     continue
@@ -762,30 +813,37 @@ class ProgressiveFetchExtract(object):
             for completed_future in as_completed(futures):
                 try:
                     prec_or_spec = completed_future.result()
-                    cache_action, extract_action = self.paired_actions[prec_or_spec]
-                    extract_future = extract_executor.submit(
-                        do_extract_action,
-                        prec_or_spec,
-                        extract_action,
-                        progress_bars[prec_or_spec],
-                    )
-                    extract_future.add_done_callback(
-                        partial(
-                            done_callback,
-                            actions=(cache_action, extract_action),
-                            exceptions=exceptions,
-                            progress_bar=progress_bars[prec_or_spec],
-                            finish=True,
-                        )
-                    )
-
-                except Exception as exc:
-                    log.debug("%r".encode("utf-8"), exc, exc_info=True)
-                    # done_callback saves exc in exceptions[]
-                    # cancel any download that has not been started
+                except BaseException as e:
+                    # Special handling for exceptions thrown inside future, not
+                    # by futures handling code. Cancel any download that has not
+                    # been started. In-progress futures will continue.
+                    # Could use executor.shutdown(cancel_futures=True) instead?
                     for future in futures:
                         future.cancel()
-                    raise
+
+                    # faster handling of KeyboardInterrupt e.g.
+                    if not isinstance(e, Exception):
+                        raise
+
+                    # break, not raise. CondaMultiError() raised if exceptions.
+                    break
+
+                cache_action, extract_action = self.paired_actions[prec_or_spec]
+                extract_future = extract_executor.submit(
+                    do_extract_action,
+                    prec_or_spec,
+                    extract_action,
+                    progress_bars[prec_or_spec],
+                )
+                extract_future.add_done_callback(
+                    partial(
+                        done_callback,
+                        actions=(cache_action, extract_action),
+                        exceptions=exceptions,
+                        progress_bar=progress_bars[prec_or_spec],
+                        finish=True,
+                    )
+                )
 
         for bar in progress_bars.values():
             bar.close()
@@ -795,13 +853,14 @@ class ProgressiveFetchExtract(object):
 
         if exceptions:
             raise CondaMultiError(exceptions)
+
         self._executed = True
 
     @staticmethod
     def _progress_bar(prec_or_spec, position=None, leave=False):
         desc = ""
         if prec_or_spec.name and prec_or_spec.version:
-            desc = "%s-%s" % (prec_or_spec.name or "", prec_or_spec.version or "")
+            desc = "{}-{}".format(prec_or_spec.name or "", prec_or_spec.version or "")
         size = getattr(prec_or_spec, "size", None)
         size_str = size and human_bytes(size) or ""
         if len(desc) > 0:
@@ -827,9 +886,7 @@ class ProgressiveFetchExtract(object):
 
 
 def do_cache_action(prec, cache_action, progress_bar, download_total=1.0):
-    """
-    This function gets called from `ProgressiveFetchExtract.execute`
-    """
+    """This function gets called from `ProgressiveFetchExtract.execute`."""
     # pass None if already cached (simplifies code)
     if not cache_action:
         return prec
@@ -849,9 +906,7 @@ def do_cache_action(prec, cache_action, progress_bar, download_total=1.0):
 
 
 def do_extract_action(prec, extract_action, progress_bar):
-    """
-    This function gets called after do_cache_action completes.
-    """
+    """This function gets called after do_cache_action completes."""
     # pass None if already extracted (simplifies code)
     if not extract_action:
         return prec
@@ -877,7 +932,7 @@ def do_reverse(actions):
 
 def done_callback(
     future: Future,
-    actions: tuple[Union[CacheUrlAction, ExtractPackageAction], ...],
+    actions: tuple[CacheUrlAction | ExtractPackageAction, ...],
     progress_bar: ProgressBar,
     exceptions: list[Exception],
     finish: bool = False,
@@ -894,11 +949,7 @@ def done_callback(
             progress_bar.refresh()
 
 
-# ##############################
-# backward compatibility
-# ##############################
-
-
+@deprecated("24.3", "24.9")
 def rm_fetched(dist):
     """
     Checks to see if the requested package is in the cache; and if so, it removes both
@@ -909,6 +960,11 @@ def rm_fetched(dist):
     raise NotImplementedError()
 
 
+@deprecated(
+    "24.3",
+    "24.9",
+    addendum="Use `conda.gateways.connection.download.download` instead.",
+)
 def download(url, dst_path, session=None, md5sum=None, urlstxt=False, retries=3):
     from ..gateways.connection.download import download as gateway_download
 

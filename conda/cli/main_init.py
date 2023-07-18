@@ -1,7 +1,9 @@
 # Copyright (C) 2012 Anaconda, Inc
 # SPDX-License-Identifier: BSD-3-Clause
-from __future__ import absolute_import, division, print_function, unicode_literals
+"""CLI implementation for `conda init`.
 
+Prepares the user's profile for running conda, and sets up the conda shell interface.
+"""
 from logging import getLogger
 
 from ..base.context import context
@@ -29,12 +31,13 @@ def execute(args, parser):
         return initialize_dev(selected_shells[0])
 
     else:
-        for_user = args.user
-        if not (args.install and args.user and args.system):
-            for_user = True
-        if args.no_user:
-            for_user = False
-
+        for_user = args.user and not args.system
         anaconda_prompt = on_win and args.anaconda_prompt
-        return initialize(context.conda_prefix, selected_shells, for_user, args.system,
-                          anaconda_prompt, args.reverse)
+        return initialize(
+            context.conda_prefix,
+            selected_shells,
+            for_user,
+            args.system,
+            anaconda_prompt,
+            args.reverse,
+        )
